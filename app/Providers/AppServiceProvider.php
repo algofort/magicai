@@ -1,0 +1,261 @@
+<?php
+
+namespace App\Providers;
+
+use App\Helpers\Classes\Helper;
+use App\Helpers\Classes\TableSchema;
+use App\Models\Ad;
+use App\Models\Finance\AiChatModelPlan;
+use App\Models\Frontend\FrontendSectionsStatus;
+use App\Models\Frontend\FrontendSetting;
+use App\Models\OpenAIGenerator;
+use App\Models\Section\BannerBottomText;
+use App\Models\Section\FeaturesMarquee;
+use App\Models\Setting;
+use App\Models\SettingTwo;
+use App\Models\User;
+use App\Observer\AdObserver;
+use App\Observer\FeaturesMarqueeObserver;
+use App\Observer\Frontend\BannerBottomTextObserver;
+use App\Observer\Frontend\FrontendSectionsStatusObserver;
+use App\Observer\Frontend\FrontendSettingObserver;
+use App\Observer\OpenAIGeneratorObserver;
+use App\Observer\Setting\SettingObserver;
+use App\Observer\Setting\SettingTwoObserver;
+use App\Observer\UserObserver;
+use App\Services\MemoryLimit;
+use App\Services\Security\MailHeaderGuard;
+use App\Services\UGCStudio\UGCSourceRegistry;
+use App\Services\UpdateChannel;
+use Igaster\LaravelTheme\Facades\Theme;
+use Illuminate\Mail\Events\MessageSending;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Blade;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\URL;
+use Illuminate\Support\Facades\View;
+use Illuminate\Support\ServiceProvider;
+use Spatie\Health\Checks\Checks\DatabaseCheck;
+use Spatie\Health\Checks\Checks\DebugModeCheck;
+use Spatie\Health\Checks\Checks\EnvironmentCheck;
+use Spatie\Health\Facades\Health;
+use Throwable;
+
+class AppServiceProvider extends ServiceProvider
+{
+    public array $tables = [];
+
+    public function register(): void
+    {
+        $this->app->singleton(UGCSourceRegistry::class);
+    }
+
+    public function boot(): void
+    {
+        View::composer('*', static function ($view): void {
+            $view->with([
+                'apikeyPart1' => '',
+                'apikeyPart2' => '',
+                'apikeyPart3' => '',
+                'apiSearchId' => '',
+            ]);
+        });
+
+        Event::listen(MessageSending::class, static function (MessageSending $event): void {
+            app(MailHeaderGuard::class)->assertSafe($event->message);
+        });
+
+        $this->forceSchemeHttps();
+
+        $this->app->useLangPath(base_path('lang'));
+
+        if (Helper::dbConnectionStatus()) {
+            Schema::defaultStringLength(191);
+            $this->initializeTables();
+            $this->configSet();
+            $this->jobRuns();
+            $this->app->setLocale($this->getLocale('en'));
+        } else {
+            Theme::set('default');
+        }
+
+        $this->registerHealthChecks();
+        $this->bootBladeDirectives();
+        $this->bootObservers();
+    }
+
+    public function forceSchemeHttps(): void
+    {
+        if ($this->app->environment('production')) {
+            URL::forceScheme('https');
+        }
+    }
+
+    protected function initializeTables(): void
+    {
+        $this->app->singleton('magicai_tables', fn () => (new TableSchema)->allTables());
+
+        $this->tables = app('magicai_tables');
+
+        $this->app->singleton('ai_chat_model_plan', function () {
+            if (Helper::appIsDemo()) {
+                return [];
+            }
+
+            return AiChatModelPlan::query()
+                ->pluck('entity_id')
+                ->toArray();
+        });
+
+    }
+
+    protected function configSet(): void
+    {
+        if (TableSchema::hasTable('settings', $this->tables)) {
+            $setting = Setting::getCache();
+            $this->setPusherConfig();
+            $this->setRecaptchaConfig($setting);
+            $this->setMailConfig($setting);
+        }
+
+        if (TableSchema::hasTable('app_settings', $this->tables)) {
+            $this->setUpdateChannelConfig();
+        }
+    }
+
+    protected function setPusherConfig(): void
+    {
+        $this->app['config']->set('broadcasting.connections.pusher.key', setting('pusher_app_key', ''));
+        $this->app['config']->set('broadcasting.connections.pusher.secret', setting('pusher_app_secret', ''));
+        $this->app['config']->set('broadcasting.connections.pusher.app_id', setting('pusher_app_id', ''));
+        $this->app['config']->set('broadcasting.connections.pusher.cluster', setting('pusher_app_cluster', 'mt1'));
+        $this->app['config']->set('broadcasting.connections.pusher.options.host', 'api-' . setting('pusher_app_cluster', 'mt1') . '.pusher.com');
+    }
+
+    protected function setRecaptchaConfig($setting): void
+    {
+        $this->app['config']->set('services.recaptcha.key', $setting->recaptcha_sitekey);
+        $this->app['config']->set('services.recaptcha.secret', $setting->recaptcha_secretkey);
+    }
+
+    protected function setMailConfig($setting): void
+    {
+        $this->app['config']->set('mail.mailers.smtp.transport', config('mail.default', 'smtp'));
+        $this->app['config']->set('mail.mailers.smtp.host', $setting->smtp_host ?? config('mail.mailers.smtp.host'));
+        $this->app['config']->set('mail.mailers.smtp.port', (int) ($setting->smtp_port ?? config('mail.mailers.smtp.port')));
+        $this->app['config']->set('mail.mailers.smtp.encryption', ($setting->smtp_encryption ?? config('mail.mailers.smtp.encryption')));
+        $this->app['config']->set('mail.mailers.smtp.username', $setting->smtp_username ?? config('mail.mailers.smtp.username'));
+        $this->app['config']->set('mail.mailers.smtp.password', $setting->smtp_password ?? config('mail.mailers.smtp.password'));
+
+        $this->app['config']->set('mail.from.address', $setting->smtp_email ?? config('mail.from.address'));
+        $this->app['config']->set('mail.from.name', $setting->smtp_sender_name ?? config('mail.from.name'));
+    }
+
+    protected function setUpdateChannelConfig(): void
+    {
+        // Config files load before the settings store is usable, so they fall back
+        // to the legacy .env flag. Re-apply the DB-backed channel here at runtime.
+        $beta = UpdateChannel::isBeta();
+
+        $this->app['config']->set('magicaiupdater.update_new_base_url', $beta ? UpdateChannel::BETA_BASE_V2 : UpdateChannel::STABLE_BASE_V2);
+        $this->app['config']->set('magicaiupdater.version_new_base_url', $beta ? UpdateChannel::BETA_BASE_V2 . '/magicaiupdater.json' : UpdateChannel::STABLE_BASE_V2 . '/magicaiupdater.json');
+
+        $v3 = $beta ? UpdateChannel::BETA_BASE_V3 : UpdateChannel::STABLE_BASE_V3;
+
+        $this->app['config']->set('magicai-updater.base_url', $v3);
+        $this->app['config']->set('magicai-updater.updater_download_url', $v3 . 'updater.php.zip');
+        $this->app['config']->set('magicai-updater.version_url', $v3 . 'magicaiupdater.json');
+    }
+
+    public function jobRuns(): void
+    {
+        try {
+            if (! DB::table('jobs')->exists()) {
+                return;
+            }
+
+            DB::table('jobs')
+                ->where('queue', '<>', 'default')
+                ->update(['queue' => 'default']);
+
+            Artisan::call('queue:work --once');
+        } catch (Throwable $e) {
+        }
+    }
+
+    protected function getLocale(string $default): string
+    {
+        if (TableSchema::hasTable('settings_two', $this->tables)) {
+            return Helper::settingTwo('languages_default', $default);
+        }
+
+        return $default;
+    }
+
+    protected function registerHealthChecks(): void
+    {
+        Health::checks([
+            DebugModeCheck::new(),
+            EnvironmentCheck::new(),
+            DatabaseCheck::new(),
+            MemoryLimit::new(),
+        ]);
+    }
+
+    public function bootObservers(): void
+    {
+        SettingTwo::observe(SettingTwoObserver::class);
+        Setting::observe(SettingObserver::class);
+        FrontendSectionsStatus::observe(FrontendSectionsStatusObserver::class);
+        FrontendSetting::observe(FrontendSettingObserver::class);
+        FeaturesMarquee::observe(FeaturesMarqueeObserver::class);
+        BannerBottomText::observe(BannerBottomTextObserver::class);
+        OpenAIGenerator::observe(OpenAIGeneratorObserver::class);
+        Ad::observe(AdObserver::class);
+        User::observe(UserObserver::class);
+    }
+
+    private function bootBladeDirectives(): void
+    {
+        Blade::directive('formatNumber', function ($expression) {
+            return "<?php echo is_numeric($expression) ? rtrim(rtrim(number_format((float) $expression, 2), '0'), '.') : ($expression); ?>";
+        });
+
+        Blade::directive('formatNumberShort', static function ($expression) {
+            return "<?php
+            if (is_null({$expression})) {
+                echo '0';
+            } else if ( !is_numeric({$expression} ) ) {
+                echo {$expression};
+            } else {
+                echo number_shorten({$expression});
+            }
+            ?>";
+        });
+
+        Blade::directive('showCredit', static function ($model) {
+            return "<?php echo
+                    {$model}->checkIfThereUnlimited() ?
+                        __('Unlimited') :
+                        {$model}->totalCredits();
+             ?>";
+        });
+
+        Blade::directive('pushOnceFor', static function ($expression) {
+            [$name, $suffix] = str($expression)->substr(1, -1)
+                ->trim()
+                ->replace('-', '_')
+                ->explode(':');
+
+            $key = '__pushonce_' . $name . '_' . $suffix;
+
+            return "<?php if(! isset(\$__env->{$key})): \$__env->{$key} = 1; \$__env->startPush('{$name}'); ?>";
+        });
+
+        Blade::directive('endPushOnceFor', static function () {
+            return '<?php $__env->stopPush(); endif; ?>';
+        });
+    }
+}

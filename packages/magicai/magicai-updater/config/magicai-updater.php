@@ -1,0 +1,11 @@
+<?php
+
+use App\Services\UpdateChannel;
+
+$path = UpdateChannel::isBeta() ? 'update-test/' : 'updater-v3/';
+
+return [
+    'base_url'             => 'https://api.liquid-themes.com/magicai/' . $path,
+    'updater_download_url' => 'https://api.liquid-themes.com/magicai/' . $path . 'updater.php.zip',
+    'version_url'          => 'https://api.liquid-themes.com/magicai/' . $path . 'magicaiupdater.json',
+];

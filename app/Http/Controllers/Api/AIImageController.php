@@ -1,0 +1,841 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Domains\Engine\Enums\EngineEnum;
+use App\Domains\Engine\Services\FalAIService;
+use App\Domains\Entity\Enums\EntityEnum;
+use App\Domains\Entity\Facades\Entity;
+use App\Enums\BedrockEngine;
+use App\Helpers\Classes\ApiHelper;
+use App\Helpers\Classes\DefaultOpenAiImageModel;
+use App\Helpers\Classes\Helper;
+use App\Http\Controllers\Controller;
+use App\Models\OpenAIGenerator;
+use App\Models\Setting;
+use App\Models\SettingTwo;
+use App\Models\Usage;
+use App\Models\User;
+use App\Models\UserOpenai;
+use App\Services\Ai\OpenAI\Image\CreateImageService;
+use Exception;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Http\File;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Random\RandomException;
+use RuntimeException;
+
+class AIImageController extends Controller
+{
+    protected $client;
+
+    protected $settings;
+
+    protected $settings_two;
+
+    public const STABLEDIFFUSION = 'stablediffusion';
+
+    public const STORAGE_S3 = 's3';
+
+    public const CLOUDFLARE_R2 = 'r2';
+
+    public const LOADING_GIF = '/themes/default/assets/img/loading.svg';
+
+    public const STORAGE_LOCAL = 'public';
+
+    public function __construct()
+    {
+        // Settings
+        $this->settings = Setting::getCache();
+        $this->settings_two = SettingTwo::getCache();
+        ApiHelper::setOpenAiKey();
+        set_time_limit(120);
+    }
+
+    /**
+     * Get Model Versions for AI Image Generation
+     *
+     * @OA\Get(
+     *      path="/api/aiimage/versions",
+     *      operationId="versions",
+     *      tags={"AI Image Generation"},
+     *      security={{ "passport": {} }},
+     *      summary="Get Model Versions for AI Image Generation (DALL-E, Stable Diffusion) from settings",
+     *
+     *      @OA\Response(
+     *          response=200,
+     *          description="Successful operation",
+     *      ),
+     * )
+     */
+    public function versions(): JsonResponse
+    {
+        return response()->json([
+            'dall-e'           => $this->settings_two->dalle,
+            'stable-diffusion' => $this->settings_two->stablediffusion_default_model,
+        ]);
+    }
+
+    /**
+     * Check if image generation is active
+     *
+     * @OA\Get(
+     *      path="/api/aiimage/check-availability",
+     *      operationId="checkActiveGeneration",
+     *      tags={"AI Image Generation"},
+     *      security={{ "passport": {} }},
+     *      summary="Check if image generation is active / available",
+     *
+     *      @OA\Response(
+     *          response=200,
+     *          description="Image generation is available.",
+     *      ),
+     *      @OA\Response(
+     *          response=409,
+     *          description="Image generation in progress. Please try again later.",
+     *      ),
+     * )
+     */
+    public function checkActiveGeneration(): JsonResponse
+    {
+        $lockKey = 'generate_image_output_lock';
+
+        // Attempt to acquire lock
+        if (! Cache::lock($lockKey, 10)->get()) {
+            // Failed to acquire lock, another process is already running
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Image generation in progress. Please try again later.',
+            ], 409);
+        }
+
+        // Release the lock
+        Cache::lock($lockKey)->forceRelease();
+
+        return response()->json([
+            'status'  => 'success',
+            'message' => 'Image generation is available.',
+        ], 200);
+    }
+
+    /**
+     * Generate Image
+     *
+     * @OA\Post(
+     *      path="/api/aiimage/generate-image",
+     *      operationId="generateImage",
+     *      tags={"AI Image Generation"},
+     *      security={{ "passport": {} }},
+     *      summary="Generate Image (DALL-E / Stable Diffusion parameters required in request)",
+     *
+     *      @OA\Response(
+     *          response=200,
+     *          description="Image generation successful. Image info in json response [images].",
+     *      ),
+     *      @OA\Response(
+     *          response=409,
+     *          description="Image generation in progress. Please try again later.",
+     *      ),
+     * )
+     */
+    public function generateImage(Request $request): JsonResponse
+    {
+        $imageParam = $request->all();
+        $post_type = 'ai_image_generator';
+        $post = OpenAIGenerator::where('slug', $post_type)->first();
+        $user = Auth::user();
+
+        return $this->imageOutput($imageParam, $post, $user);
+    }
+
+    // This functions is copied from app/Http/Controllers/AIController.php as it is
+    public function imageOutput($param, $post, $user): JsonResponse
+    {
+        $lockKey = 'generate_image_output_lock';
+        if (! Cache::lock($lockKey, 10)->get()) { // Attempt to acquire lock
+            return response()->json(['message' => 'Image generation in progress. Please try again later.'], 409);
+        }
+
+        $imageGenerator = $param['image_generator'] ?? null;
+        $engineCheck = $this->resolveImageEngineSlug($imageGenerator);
+        $entries = [];
+
+        try {
+            $engine = EngineEnum::fromSlug($engineCheck);
+            $model = $this->resolveImageModel($imageGenerator, $engine);
+            $code = $this->getEngineCode($engine);
+            $number_of_images = (int) ($param['image_number_of_images'] ?? 1);
+
+            $driver = Entity::driver($model)->inputImageCount($number_of_images)->calculateCredit();
+            $chkLmt = Helper::checkImageDailyLimit($lockKey);
+            if ($chkLmt->getStatusCode() === 429) {
+                return $chkLmt;
+            }
+            $driver->redirectIfNoCreditBalance();
+            $apiKey = $this->getOpenAiApiKey($user);
+            config(['openai.api_key' => $apiKey]);
+            set_time_limit(120);
+
+            for ($i = 0; $i < $number_of_images; $i++) {
+                $imageDetails = $this->processImageGeneration($engine, $model, $param);
+                $savePath = $this->saveImageOutputToStorage($imageDetails);
+                $entry = $this->saveEntryToDatabase($imageDetails, $user, $post, $code, $savePath);
+                $entry->img_id = 'img-' . $entry->response . '-' . $entry->id;
+                $entries[] = $entry;
+            }
+            $driver->decreaseCredit();
+            Usage::getSingle()->updateImageCounts($driver->calculate());
+            Cache::lock($lockKey)->release();
+
+        } catch (Exception $e) {
+            return response()->json(['status' => 'error', 'message' => $e->getMessage()]);
+        } finally {
+            Cache::lock($lockKey)->forceRelease();
+        }
+
+        return response()->json(['status' => 'success', 'images' => $entries, 'image_storage' => $this->settings_two->ai_image_storage]);
+    }
+
+    private function resolveImageEngineSlug(?string $imageGenerator): string
+    {
+        return match ($imageGenerator) {
+            'flux-pro',
+            'flux-2-flex',
+            'flux-2-flex/edit',
+            'ideogram',
+            'flux-pro-kontext',
+            'nano-banana',
+            'nano-banana-pro',
+            'nano-banana/edit',
+            'nano-banana-pro/edit',
+            EntityEnum::SEEDREAM_4->value,
+            EntityEnum::SEEDREAM_4_EDIT->value,
+            EntityEnum::GROK_IMAGINE_IMAGE->value,
+            EntityEnum::GROK_IMAGINE_IMAGE_EDIT->value => EngineEnum::FAL_AI->value,
+            EntityEnum::GPT_IMAGE_1->value,
+            EntityEnum::GPT_IMAGE_1_5->value,
+            EntityEnum::GPT_IMAGE_2->value,
+            EntityEnum::GPT_IMAGE_2_5_SUNBURST->value,
+            EntityEnum::GPT_IMAGE_2_5_FLARE->value,
+            'gpt-image-1',
+            'gpt-image-1.5',
+            'gpt-image-1-5',
+            'gpt-image-2',
+            'gpt-image-2.5-sunburst',
+            'gpt-image-2.5-flare',
+            'dall-e' => EngineEnum::OPEN_AI->value,
+            default  => $imageGenerator ?? EngineEnum::OPEN_AI->value,
+        };
+    }
+
+    private function resolveImageModel(?string $imageGenerator, ?EngineEnum $engine): ?EntityEnum
+    {
+        return match ($imageGenerator) {
+            'flux-pro-kontext'                         => $this->getKontextModel(),
+            'nano-banana'                              => EntityEnum::NANO_BANANA,
+            'nano-banana-pro'                          => EntityEnum::NANO_BANANA_PRO,
+            'nano-banana/edit'                         => EntityEnum::NANO_BANANA_EDIT,
+            'nano-banana-pro/edit'                     => EntityEnum::NANO_BANANA_PRO_EDIT,
+            EntityEnum::SEEDREAM_4->value              => EntityEnum::SEEDREAM_4,
+            EntityEnum::SEEDREAM_4_EDIT->value         => EntityEnum::SEEDREAM_4_EDIT,
+            EntityEnum::GROK_IMAGINE_IMAGE->value      => EntityEnum::GROK_IMAGINE_IMAGE,
+            EntityEnum::GROK_IMAGINE_IMAGE_EDIT->value => EntityEnum::GROK_IMAGINE_IMAGE_EDIT,
+            'flux-2-flex'                              => EntityEnum::FLUX_2_FLEX,
+            'flux-2-flex/edit'                         => EntityEnum::FLUX_2_FLEX_EDIT,
+            'ideogram'                                 => EntityEnum::IDEOGRAM,
+            'gpt-image-1'                              => EntityEnum::GPT_IMAGE_1,
+            'gpt-image-1.5', 'gpt-image-1-5' => EntityEnum::GPT_IMAGE_1_5,
+            'gpt-image-2'                    => EntityEnum::GPT_IMAGE_2,
+            'gpt-image-2.5-sunburst'         => EntityEnum::GPT_IMAGE_2_5_SUNBURST,
+            'gpt-image-2.5-flare'            => EntityEnum::GPT_IMAGE_2_5_FLARE,
+            default                          => $this->getDefaultModel($engine),
+        };
+    }
+
+    private function getOpenAIApiKey(): string
+    {
+        return ApiHelper::setOpenAiKey();
+    }
+
+    private function getStableApiKey(): string
+    {
+        $stableDiffusionKeys = explode(',', $this->settings_two->stable_diffusion_api_key);
+
+        return $stableDiffusionKeys[array_rand($stableDiffusionKeys)];
+    }
+
+    /**
+     * Get the default model based on the AI engine.
+     *
+     * @throws Exception
+     */
+    private function getDefaultModel(?EngineEnum $engine): ?EntityEnum
+    {
+        return match ($engine) {
+            EngineEnum::OPEN_AI          => $this->getDefaultOpenAiImageModel(),
+            EngineEnum::STABLE_DIFFUSION => $this->getStableDiffusionDefaultModel(),
+            EngineEnum::FAL_AI           => $this->getDefaultFalAiModel(),
+
+            default                      => throw new Exception(__('Invalid AI Engine')),
+        };
+    }
+
+    /**
+     * Process image generation based on the AI engine.
+     *
+     * @throws Exception|GuzzleException
+     */
+    private function processImageGeneration(?EngineEnum $engine, ?EntityEnum $model, array $param): array
+    {
+        return match ($engine) {
+            EngineEnum::OPEN_AI          => $this->processOpenAIImage($model, $param),
+            EngineEnum::STABLE_DIFFUSION => $this->processStableDiffusionImage($model, $param),
+            EngineEnum::FAL_AI           => $this->processFalAIImage($model, $param),
+
+            default                      => throw new Exception(__('Invalid AI Engine')),
+        };
+    }
+
+    private function processOpenAIImage(?EntityEnum $model, array $param): array
+    {
+        $is_demo = Helper::appIsDemo();
+        $size = $param['size'];
+        $description = $param['description'];
+        $style = $param['image_style'] ?? null;
+        $lighting = $param['image_lighting'] ?? null;
+        $mood = $param['mood'] ?? null;
+        $quality = $param['quality'];
+        $prompt = $description;
+        if (is_null($prompt)) {
+            throw new RuntimeException(__('You must provide a prompt'));
+        }
+        $attributes = [
+            'style'    => $style ? "$style style" : null,
+            'lighting' => $lighting ? "$lighting lighting" : null,
+            'mood'     => $mood ? "$mood mood" : null,
+        ];
+        $prompt .= ' ' . implode(' ', array_filter($attributes));
+
+        // GptImageParamNormalizer strips response_format and coerces size/quality to
+        // the values gpt-image models accept; the raw images endpoint rejects both.
+        $base64 = app(CreateImageService::class)
+            ->setModel(($model ?? DefaultOpenAiImageModel::FALLBACK)->value)
+            ->setPrompt($prompt)
+            ->setSize($is_demo ? '1024x1024' : (string) $size)
+            ->setQuality($is_demo ? 'low' : (string) $quality)
+            ->setOutputFormat('png')
+            ->generateForAi();
+
+        if ($base64 === null) {
+            throw new RuntimeException(__('Image generation failed'));
+        }
+
+        $contents = base64_decode($base64);
+        $nameOfImage = Str::random(12) . '-GPT-IMG-' . Str::slug(explode(' ', mb_substr($prompt, 0, 15))[0]) . '.png';
+
+        return [
+            'prompt'                => $prompt,
+            'imageContent'          => $contents,
+            'nameOfImage'           => $nameOfImage,
+        ];
+    }
+
+    /**
+     * @throws GuzzleException
+     * @throws RandomException
+     * @throws JsonException
+     */
+    private function processStableDiffusionImage(?EntityEnum $model, array $param): array
+    {
+        $stable_type = $param['type'];
+        $prompt = $param['stable_description'];
+        if (is_null($prompt)) {
+            throw new RuntimeException(__('You must provide a prompt'));
+        }
+
+        $negative_prompt = $param['negative_prompt'];
+        $style_preset = $param['style_preset'];
+        $sampler = $param['sampler'];
+        $clip_guidance_preset = $param['clip_guidance_preset'];
+        $image_resolution = $param['image_resolution'];
+        $init_image = $param['image_src'] ?? null;
+        $mood = $param['mood'] ?? null;
+        $defaultSdModel = $this->getStableDiffusionDefaultModel()->value;
+
+        $isV2BetaModels = EntityEnum::tryFrom($defaultSdModel)?->isV2BetaSdEntity() ?? false;
+        $width = (int) explode('x', $image_resolution)[0];
+        $height = (int) explode('x', $image_resolution)[1];
+
+        if ($defaultSdModel === BedrockEngine::BEDROCK->value && $stable_type === 'text-to-image') {
+            $response = $this->bedrockService->invokeStableDiffusion($prompt, random_int(1, 1000000), $width, $height);
+            $nameOfImage = Str::random(12) . '-AWS-SD-' . Str::slug(explode(' ', mb_substr($prompt, 0, 15))[0]) . '.png';
+
+            return [
+                'prompt'                => $prompt,
+                'imageContent'          => $response,
+                'nameOfImage'           => $nameOfImage,
+            ];
+        }
+        $stableDiffusionKey = $this->getStableApiKey();
+        if (empty($stableDiffusionKey)) {
+            throw new RuntimeException(__('You must provide a StableDiffusion API Key.'));
+        }
+
+        $sd3Payload = [];
+        $baseUri = in_array($defaultSdModel, $v2BetaModels, true) && in_array($stable_type, ['text-to-image', 'image-to-image'], true)
+            ? 'https://api.stability.ai/v2beta/stable-image/generate/'
+            : 'https://api.stability.ai/v1/generation/';
+        $contentType = ($stable_type === 'upscale' || $stable_type === 'image-to-image') ? 'multipart/form-data' : 'application/json';
+        $client = new Client([
+            'base_uri' => $baseUri,
+            'headers'  => [
+                'Content-Type'  => $contentType,
+                'Authorization' => 'Bearer ' . $stableDiffusionKey,
+                'Accept'        => 'application/json',
+            ],
+        ]);
+        $payload = [
+            'cfg_scale'            => 7,
+            'clip_guidance_preset' => $clip_guidance_preset ?? 'NONE',
+            'samples'              => 1,
+            'steps'                => 50,
+        ];
+        if ($sampler) {
+            $payload['sampler'] = $sampler;
+        }
+        if ($style_preset) {
+            $payload['style_preset'] = $style_preset;
+        }
+        $content_type = 'json';
+        switch ($stable_type) {
+            case 'multi-prompt':
+                $stable_url = 'text-to-image';
+                $payload['width'] = $width;
+                $payload['height'] = $height;
+                $arr = [];
+                foreach ($prompt as $p) {
+                    $arr[] = [
+                        'text'   => $p . ($mood === null ? '' : (' ' . $mood . ' mood.')),
+                        'weight' => 1,
+                    ];
+                }
+                $prompt = $arr;
+                $payload['text_prompts'] = $prompt;
+
+                break;
+            case 'upscale':
+                $content_type = 'multipart';
+                $stable_url = 'image-to-image/upscale';
+                $defaultSdModel = 'esrgan-v1-x2plus';
+                $payload = [];
+                $payload['image'] = $init_image->get();
+                $prompt = [
+                    [
+                        'text'   => $prompt . '-' . Str::random(16),
+                        'weight' => 1,
+                    ],
+                ];
+
+                break;
+            case 'image-to-image':
+                $content_type = 'multipart';
+                $stable_url = $stable_type;
+                $payload['init_image'] = $init_image->get();
+                $sd3Payload = [
+                    [
+                        'name'     => 'prompt',
+                        'contents' => $prompt,
+                    ],
+                    [
+                        'name'     => 'mode',
+                        'contents' => 'image-to-image',
+                    ],
+                    [
+                        'name'     => 'strength',
+                        'contents' => 0,
+                    ],
+                    [
+                        'name'     => 'image',
+                        'contents' => $init_image->get(),
+                        'filename' => $init_image->getClientOriginalName(),
+                    ],
+                ];
+                $prompt = [
+                    [
+                        'text'   => $prompt . ($mood === null ? '' : (' ' . $mood . ' mood.')),
+                        'weight' => 1,
+                    ],
+                ];
+                $payload['text_prompts'] = $prompt;
+
+                break;
+            default:
+                $stable_url = $stable_type;
+                $payload['width'] = $width;
+                $payload['height'] = $height;
+                $sd3Payload = [
+                    [
+                        'name'     => 'prompt',
+                        'contents' => $prompt,
+                    ],
+                    [
+                        'name'     => 'file',
+                        'contents' => 'no',
+                    ],
+                    [
+                        'name'     => 'output_format',
+                        'contents' => 'png',
+                    ],
+                ];
+                $prompt = [
+                    [
+                        'text'   => $prompt . ($mood === null ? '' : (' ' . $mood . ' mood.')),
+                        'weight' => 1,
+                    ],
+                ];
+                $payload['text_prompts'] = $prompt;
+
+                break;
+        }
+        if ($negative_prompt) {
+            $prompt[] = ['text' => $negative_prompt, 'weight' => -1];
+        }
+        if ($content_type === 'multipart') {
+            $multipart = [];
+            foreach ($payload as $key => $value) {
+                if (! is_array($value)) {
+                    $multipart[] = ['name' => $key, 'contents' => $value];
+
+                    continue;
+                }
+                foreach ($value as $multiKey => $multiValue) {
+                    $multiName = $key . '[' . $multiKey . ']' . (is_array($multiValue) ? '[' . key($multiValue) . ']' : '') . '';
+                    $multipart[] = ['name' => $multiName, 'contents' => (is_array($multiValue) ? reset($multiValue) : $multiValue)];
+                }
+            }
+            $payload = $multipart;
+        }
+
+        try {
+            if ($isV2BetaModels && in_array($stable_type, ['text-to-image', 'image-to-image'], true)) {
+                // 'sd3' is the v2beta endpoint path; the selected model goes in the model field.
+                $sd3Payload[] = ['name' => 'model', 'contents' => $defaultSdModel];
+                $response = $client->post('sd3', [
+                    'headers'   => ['accept' => 'application/json'],
+                    'multipart' => $sd3Payload,
+                ]);
+            } else {
+                $defaultSdModel = $stable_type === 'multi-prompt' ? EntityEnum::STABLE_DIFFUSION_XL_1024_V_1_0->value : $defaultSdModel;
+                $response = $client->post("$defaultSdModel/$stable_url", [
+                    $content_type => $payload,
+                ]);
+            }
+        } catch (Exception $e) {
+            if ($e->hasResponse()) {
+                $errorMessage = $e->getResponse()->getBody()->getContents();
+                $errorData = json_decode($errorMessage, true, 512, JSON_THROW_ON_ERROR);
+
+                throw new RuntimeException($errorData['message']);
+            }
+
+            throw new RuntimeException($e->getMessage());
+        }
+
+        $body = $response->getBody();
+        if ($response->getStatusCode() === 200) {
+            $nameOfPrompt = explode(' ', mb_substr($prompt[0]['text'], 0, 15))[0];
+            $nameOfImage = Str::random(12) . '-STABLE-' . $nameOfPrompt . '.png';
+            if (
+                ($stable_type === 'text-to-image' || $stable_type === 'image-to-image') && in_array($defaultSdModel, $v2BetaModels, true)
+            ) {
+                $contents = base64_decode(json_decode($body, false, 512, JSON_THROW_ON_ERROR)->image);
+            } else {
+                $contents = base64_decode(json_decode($body, false, 512, JSON_THROW_ON_ERROR)->artifacts[0]->base64);
+            }
+        } else {
+            if ($body->status === 'error') {
+                $message = $body->message;
+            } else {
+                $message = __('Failed, Try Again');
+            }
+
+            throw new RuntimeException($message);
+        }
+
+        return [
+            'prompt'                => $prompt[0]['text'],
+            'imageContent'          => $contents,
+            'nameOfImage'           => $nameOfImage,
+        ];
+    }
+
+    private function processFalAIImage(?EntityEnum $model, array $param): array
+    {
+        $prompt = ($param['image_generator'] ?? null) === 'ideogram'
+            ? ($param['description_ideogram'] ?? null)
+            : ($param['description_flux_pro'] ?? ($param['description'] ?? null));
+
+        if (is_null($prompt)) {
+            throw new RuntimeException(__('You must provide a prompt'));
+        }
+
+        if (! $model) {
+            throw new RuntimeException(__('Invalid AI model'));
+        }
+
+        if (FalAIService::isGrokModel($model)) {
+            return $this->processGrokSyncImage($model, $prompt);
+        }
+
+        if ($model === EntityEnum::IDEOGRAM) {
+            $requestId = FalAIService::ideogramGenerate($prompt);
+        } elseif ($model === EntityEnum::FLUX_PRO_KONTEXT || $model === EntityEnum::FLUX_PRO_KONTEXT_MAX_MULTI) {
+            $requestId = FalAIService::generateKontext($prompt, $model, request('image_src'));
+        } else {
+            $requestId = FalAIService::generate($prompt, $model);
+        }
+
+        return [
+            'engine'                => EngineEnum::FAL_AI,
+            'requestId'             => $requestId,
+            'status'                => 'IN_QUEUE',
+            'output'                => asset(self::LOADING_GIF),
+            'prompt'                => $prompt,
+            'imageContent'          => null,
+            'nameOfImage'           => Str::random(12) . '-FLUX-' . Str::slug(explode(' ', mb_substr($prompt, 0, 15))[0]) . '.png',
+        ];
+    }
+
+    private function processGrokSyncImage(EntityEnum $model, string $prompt): array
+    {
+        $result = FalAIService::generateGrokSync($prompt, $model);
+        $imageUrl = (string) data_get($result, 'images.0.url', '');
+
+        if ($imageUrl === '') {
+            throw new RuntimeException(__('Image generation failed.'));
+        }
+
+        $imagePayload = $this->resolveFalImagePayload(
+            $imageUrl,
+            (string) data_get($result, 'images.0.content_type', '')
+        );
+
+        if (! $imagePayload) {
+            throw new RuntimeException(__('Failed to download generated image.'));
+        }
+
+        $extension = mimeToExtension($imagePayload['mime'] ?: 'image/png');
+        if (! $extension) {
+            $extension = pathinfo((string) parse_url($imageUrl, PHP_URL_PATH), PATHINFO_EXTENSION) ?: 'png';
+        }
+
+        return [
+            'engine'       => EngineEnum::FAL_AI,
+            'requestId'    => null,
+            'status'       => 'COMPLETED',
+            'prompt'       => $prompt,
+            'imageContent' => $imagePayload['binary'],
+            'nameOfImage'  => Str::random(12) . '-GROK-' . Str::slug(explode(' ', mb_substr($prompt, 0, 15))[0]) . '.' . $extension,
+        ];
+    }
+
+    private function resolveFalImagePayload(string $imageUrl, string $fallbackMimeType = ''): ?array
+    {
+        if (str_starts_with($imageUrl, 'data:image')) {
+            if (! preg_match('/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/', $imageUrl, $matches)) {
+                return null;
+            }
+
+            $binary = base64_decode(str_replace(' ', '+', $matches[2]), true);
+            if ($binary === false) {
+                return null;
+            }
+
+            return [
+                'binary' => $binary,
+                'mime'   => $matches[1],
+            ];
+        }
+
+        $response = Http::timeout(120)->get($imageUrl);
+        if (! $response->successful()) {
+            return null;
+        }
+
+        $mimeType = $response->header('Content-Type');
+        if (is_string($mimeType)) {
+            $mimeType = trim(strtok($mimeType, ';'));
+        } else {
+            $mimeType = '';
+        }
+
+        return [
+            'binary' => $response->body(),
+            'mime'   => $mimeType ?: $fallbackMimeType,
+        ];
+    }
+
+    private function getKontextModel(): EntityEnum
+    {
+        $imageSrc = request('image_src');
+
+        if ($imageSrc === null) {
+            return EntityEnum::FLUX_PRO_KONTEXT_TEXT_TO_IMAGE;
+        }
+
+        if (is_array($imageSrc)) {
+            return count($imageSrc) === 1 ? EntityEnum::FLUX_PRO_KONTEXT : EntityEnum::FLUX_PRO_KONTEXT_MAX_MULTI;
+        }
+
+        return EntityEnum::FLUX_PRO_KONTEXT_TEXT_TO_IMAGE;
+    }
+
+    private function saveEntryToDatabase(array $imageDetails, User $user, OpenAIGenerator $post, string $code, string $savePath): UserOpenai
+    {
+        $data = [
+            'team_id'   => $user->team_id,
+            'title'     => $imageDetails['nameOfImage'],
+            'slug'      => Str::random(7) . Str::slug($user?->fullName()) . '-workbook',
+            'user_id'   => $user->id,
+            'openai_id' => $post->id,
+            'input'     => $imageDetails['prompt'],
+            'response'  => $code,
+            'output'    => ThumbImage(url($savePath)),
+            'hash'      => Str::random(256),
+            'credits'   => 1,
+            'words'     => 0,
+            'storage'   => $this->settings_two->ai_image_storage,
+            'payload'   => request()?->all(),
+            'engine'	   => isset($imageDetails['engine']) ? $imageDetails['engine']?->value : null,
+        ];
+        $isQueuedEngineOutput = isset($imageDetails['engine'])
+            && $imageDetails['engine'] === EngineEnum::FAL_AI
+            && empty($imageDetails['imageContent']);
+
+        if ($isQueuedEngineOutput) {
+            $data['request_id'] = $imageDetails['requestId'];
+            $data['status'] = $imageDetails['status'];
+            $data['output'] = $imageDetails['output'];
+        }
+
+        return UserOpenai::create($data);
+    }
+
+    private function saveImageOutputToStorage(array $imageDetails): string
+    {
+        $isQueuedEngineOutput = isset($imageDetails['engine'])
+            && $imageDetails['engine'] === EngineEnum::FAL_AI
+            && empty($imageDetails['imageContent']);
+
+        if ($isQueuedEngineOutput) {
+            return '/';
+        }
+
+        $image_storage = $this->settings_two->ai_image_storage;
+
+        return match ($image_storage) {
+            self::STORAGE_S3    => $this->saveImageToS3($imageDetails),
+            self::CLOUDFLARE_R2 => $this->saveImageToR2($imageDetails),
+            default             => $this->saveImageToLocal($imageDetails),
+        };
+    }
+
+    private function saveImageToS3(array $imageDetails): string
+    {
+        $localPath = $this->saveImageToLocal($imageDetails);
+
+        try {
+            $uploadedFile = new File($localPath);
+            $aws_path = Storage::disk('s3')->put('', $uploadedFile);
+            unlink($localPath);
+            $fullAWSPath = Storage::disk('s3')->url($aws_path);
+        } catch (Exception $e) {
+            throw new RuntimeException('AWS Error - ' . $e->getMessage());
+        }
+
+        return $fullAWSPath;
+    }
+
+    private function saveImageToLocal(array $imageDetails): string
+    {
+        Storage::disk('public')->put($imageDetails['nameOfImage'], $imageDetails['imageContent']);
+
+        return 'uploads/' . $imageDetails['nameOfImage'];
+    }
+
+    private function saveImageToR2(array $imageDetails): string
+    {
+        Storage::disk('r2')->put($imageDetails['nameOfImage'], $imageDetails['imageContent']);
+
+        return Storage::disk('r2')->url($imageDetails['nameOfImage']);
+    }
+
+    private function getEngineCode(?EngineEnum $engine): string
+    {
+        return match ($engine) {
+            EngineEnum::STABLE_DIFFUSION => 'SD',
+            EngineEnum::FAL_AI           => 'FL',
+            default                      => 'DE',
+        };
+    }
+
+    private function getDefaultOpenAiImageModel(): EntityEnum
+    {
+        return DefaultOpenAiImageModel::resolve($this->settings_two);
+    }
+
+    private function getStableDiffusionDefaultModel(): EntityEnum
+    {
+        return EntityEnum::fromSlug($this->settings_two?->stablediffusion_default_model) ?? EntityEnum::SD_3_5_LARGE;
+    }
+
+    private function getDefaultFalAiModel(): EntityEnum
+    {
+        return EntityEnum::fromSlug(setting('fal_ai_default_model', EntityEnum::FLUX_PRO->value)) ?? EntityEnum::FLUX_PRO;
+    }
+
+    /**
+     * Get latest 10 images
+     *
+     * @OA\Get(
+     *      path="/api/aiimage/recent-images",
+     *      operationId="getRecentImages",
+     *      tags={"AI Image Generation"},
+     *      security={{ "passport": {} }},
+     *      summary="Get latest 10 images",
+     *
+     *      @OA\Response(
+     *          response=200,
+     *          description="Successful operation",
+     *      ),
+     * )
+     */
+    public function getRecentImages(Request $request)
+    {
+
+        $user = $request->user();
+        $openai = OpenAIGenerator::where('slug', 'ai_image_generator')->firstOrFail();
+        $documents = UserOpenai::where('user_id', $user->id)
+            ->where('openai_id', $openai->id)
+            ->when(Schema::hasColumn('user_openai', 'is_fashion_studio'), function ($query) {
+                $query->where('is_fashion_studio', false);
+            })
+            ->when(Schema::hasColumn('user_openai', 'is_ai_photo_studio'), function ($query) {
+                $query->where('is_ai_photo_studio', false);
+            })
+            ->latest('created_at')
+            ->take(10)
+            ->get();
+
+        return response()->json($documents, 200);
+
+    }
+}
