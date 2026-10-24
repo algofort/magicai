@@ -117,6 +117,14 @@
          Multiple module scripts in the same document execute in DOM order
          after the document is parsed, so anything pushed here runs before
          Alpine boots from the main app.js entry below. --}}
+    @php
+        $magicaiRequestBasePath = rtrim((string) parse_url(config('app.url'), PHP_URL_PATH), '/');
+    @endphp
+    <script>
+        window.magicaiBasePath = @json($magicaiRequestBasePath);
+    </script>
+    <script src="{{ custom_theme_url('/assets/js/panel/subdirectory-requests.js') }}?v={{ filemtime(public_path('themes/default/assets/js/panel/subdirectory-requests.js')) }}"></script>
+
     @stack('script-before')
 
     @vite(\App\Helpers\Classes\ThemeHelper::appJsPath())

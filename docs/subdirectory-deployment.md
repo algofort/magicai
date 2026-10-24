@@ -43,3 +43,30 @@ Local checks cover root/subdirectory asset generation, external/CDN paths,
 duplicate-prefix prevention, auth requests/redirects and non-JSON error recovery.
 They do not create a user, send mail, alter activation or consume AI credits.
 This patch is not a full audit of every dashboard feature's hardcoded URLs.
+
+## Dashboard chat and settings requests
+
+The panel now loads `subdirectory-requests.js` before its application bundle.
+It prefixes root-relative dashboard, Livewire, file-upload and editor-save
+requests using APP_URL's path. A jQuery prefilter handles chat creation and
+admin saves; the fetch adapter handles chat lists and streamed generation.
+Already-prefixed, absolute provider/CDN URLs, other projects' paths and Request
+objects remain unchanged. Request bodies, headers, abort signals and response
+streams are passed through. No global server configuration changes are needed.
+
+Deploy this update as the MagicAI owner, with normal `umask 022` for Git writes
+(use `umask 077` only inside backup operations). Check local changes before
+pulling; retain the existing public/storage symlink. No dependency installation,
+asset build, migrations, service restarts or database reset is needed. Run:
+
+```bash
+php8.4 scripts/test-subdirectory.php
+node --test scripts/test-auth-subdirectory.mjs scripts/test-dashboard-subdirectory.mjs
+php8.4 artisan view:clear
+```
+
+Then hard-refresh AI Chat, create a conversation, select a configured Gemini
+model and send one short message. The chat page may initially select an OpenAI
+model; adding a Gemini API key does not change that selection. Confirm model
+access/credits and API quota separately. A live generation result still needs
+verification after this patch is deployed.

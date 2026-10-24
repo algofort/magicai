@@ -46,15 +46,17 @@ echo "Asset URL and shared helper checks passed.\n";
 // Check the generated PHP too: complex expressions inside @json can compile
 // incorrectly even when the original Blade file looks syntactically valid.
 $blade = new \Illuminate\View\Compilers\BladeCompiler(new \Illuminate\Filesystem\Filesystem, sys_get_temp_dir());
-$template = file_get_contents(dirname(__DIR__) . '/resources/views/default/panel/layout/scripts.blade.php');
-$compiled = tempnam(sys_get_temp_dir(), 'magicai-blade-');
-try {
-    file_put_contents($compiled, $blade->compileString($template));
-    exec(escapeshellarg(PHP_BINARY) . ' -l ' . escapeshellarg($compiled), $output, $status);
-    if ($status !== 0) {
-        throw new RuntimeException('Compiled auth Blade PHP failed syntax check.');
+foreach (['scripts.blade.php', 'partials/head.blade.php'] as $view) {
+    $template = file_get_contents(dirname(__DIR__) . '/resources/views/default/panel/layout/' . $view);
+    $compiled = tempnam(sys_get_temp_dir(), 'magicai-blade-');
+    try {
+        file_put_contents($compiled, $blade->compileString($template));
+        exec(escapeshellarg(PHP_BINARY) . ' -l ' . escapeshellarg($compiled), $output, $status);
+        if ($status !== 0) {
+            throw new RuntimeException('Compiled Blade PHP failed syntax check: ' . $view);
+        }
+    } finally {
+        unlink($compiled);
     }
-} finally {
-    unlink($compiled);
 }
-echo "Compiled authentication Blade syntax check passed.\n";
+echo "Compiled dashboard and authentication Blade syntax checks passed.\n";

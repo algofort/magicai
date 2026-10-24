@@ -2,6 +2,7 @@
 <script src="{{ custom_theme_url('/assets/libs/jquery/jquery.min.js') }}"></script>
 <script src="{{ custom_theme_url('/assets/libs/toastr/toastr.min.js') }}"></script>
 <script>
+	window.magicaiInstallAjaxPaths(window.jQuery);
 	$.ajaxSetup({
 		headers: {
 			'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')
