@@ -26,14 +26,14 @@
                 <img
                     class="peer absolute start-0 top-1/2 -translate-y-1/2 translate-x-3 opacity-0 transition-all group-[.lqd-is-sticky]/header:translate-x-0 group-[.lqd-is-sticky]/header:opacity-100"
                     src="{{ custom_theme_url($setting->logo_sticky_path, true) }}"
-                    @if (isset($setting->logo_sticky_2x_path)) srcset="/{{ $setting->logo_sticky_2x_path }} 2x" @endif
+                    @if (isset($setting->logo_sticky_2x_path)) srcset="{{ custom_theme_url($setting->logo_sticky_2x_path, true) }} 2x" @endif
                     alt="{{ custom_theme_url($setting->site_name) }} logo"
                 >
             @endif
             <img
                 class="transition-all group-[.lqd-is-sticky]/header:peer-first:translate-x-2 group-[.lqd-is-sticky]/header:peer-first:opacity-0"
                 src="{{ custom_theme_url($setting->logo_path, true) }}"
-                @if (isset($setting->logo_2x_path)) srcset="/{{ $setting->logo_2x_path }} 2x" @endif
+                @if (isset($setting->logo_2x_path)) srcset="{{ custom_theme_url($setting->logo_2x_path, true) }} 2x" @endif
                 alt="{{ $setting->site_name }} logo"
             >
         </a>

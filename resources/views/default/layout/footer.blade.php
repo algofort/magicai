@@ -59,7 +59,7 @@
                     @if (isset($setting->logo_2x_path))
                         <img
                             src="{{ custom_theme_url($setting->logo_path, true) }}"
-                            srcset="/{{ $setting->logo_2x_path }} 2x"
+                            srcset="{{ custom_theme_url($setting->logo_2x_path, true) }} 2x"
                             alt="{{ $setting->site_name }} logo"
                         >
                     @else
@@ -90,7 +90,7 @@
                         <li>
                             <a
                                 class="inline-flex items-center gap-2"
-                                href="/page/{{ $page->slug }}"
+                                href="{{ url('/page/' . $page->slug) }}"
                             >
                                 {{ $page->title }}
                             </a>

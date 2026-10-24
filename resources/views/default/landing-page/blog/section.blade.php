@@ -21,7 +21,7 @@
         <div class="flex justify-center">
             <a
                 class="group flex space-x-2"
-                href="/blog"
+                href="{{ url('/blog') }}"
             >
                 <div class="rounded-md bg-green-100 px-2 py-1 text-[12px] font-semibold text-green-500 transition-colors group-hover:bg-green-200">
                     <svg

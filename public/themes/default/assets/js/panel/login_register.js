@@ -1,3 +1,16 @@
+// Keep auth requests and redirects inside the application, including subfolders.
+function magicaiAuthUrl(path) {
+	if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) return path;
+	const base = (window.magicaiBasePath || '').replace(/\/+$/, '');
+	if (!base || path === base || path.startsWith(base + '/') || path.startsWith(base + '?') || path.startsWith(base + '#')) return path;
+	return base + path;
+}
+
+function magicaiAuthErrors(response) {
+	const payload = response.responseJSON || {};
+	return payload.errors || { message: payload.message || magicai_localize.something_wrong || 'Request failed. Please try again.' };
+}
+
 //LOGIN
 function LoginForm() {
 	'use strict';
@@ -42,7 +55,7 @@ function LoginForm() {
 	// Ajax Post
 	$.ajax({
 		type: 'post',
-		url: '/login',
+		url: magicaiAuthUrl('/login'),
 		data: formData,
 		contentType: false,
 		processData: false,
@@ -52,18 +65,13 @@ function LoginForm() {
 			toastr.success(magicai_localize.login_redirect);
 
 			var href = (data && typeof data.link === 'string') ? data.link : '/dashboard/user';
-			window.location.href = href;
+			window.location.href = magicaiAuthUrl(href);
 			// Alpine.store('appLoadingIndicator').hide();
 		},
 		error: function (data) {
-			if (data.responseJSON.errors) {
-				var err = data.responseJSON.errors;
-				$.each(err, function (index, value) {
-					toastr.error(value);
-				});
-			} else if (data.responseJSON.message) {
-				toastr.error(data.responseJSON.message);
-			}
+			$.each(magicaiAuthErrors(data), function (index, value) {
+				toastr.error(value);
+			});
 			document.getElementById('LoginFormButton').disabled = false;
 			document.getElementById('LoginFormButton').innerHTML = magicai_localize.sign_in;
 			Alpine.store('appLoadingIndicator').hide();
@@ -113,7 +121,7 @@ function RegisterForm() {
 
 	$.ajax({
 		type: 'post',
-		url: '/register',
+		url: magicaiAuthUrl('/register'),
 		data: formData,
 		contentType: false,
 		processData: false,
@@ -121,17 +129,17 @@ function RegisterForm() {
 			toastr.success(magicai_localize.register_redirect);
 			setTimeout(function () {
 				if (plan) {
-					window.location.href = '/dashboard/user/payment?plan=' + plan;
+					window.location.href = magicaiAuthUrl('/dashboard/user/payment?plan=' + encodeURIComponent(plan));
 				} else {
-					window.location.href = '/dashboard';
+					window.location.href = magicaiAuthUrl('/dashboard');
 				}
 				// location.reload();
 				Alpine.store('appLoadingIndicator').hide();
 			}, 1500);
 		},
 		error: function (data) {
-			let err = data.responseJSON.errors;
-			let type = data.responseJSON.type;
+			let err = magicaiAuthErrors(data);
+			let type = data.responseJSON && data.responseJSON.type;
 
 			$.each(err, function (index, value) {
 				toastr.error(value);
@@ -139,7 +147,7 @@ function RegisterForm() {
 
 			if (type === 'confirmation') {
 				setTimeout(function () {
-					location.href = '/login';
+					location.href = magicaiAuthUrl('/login');
 					Alpine.store('appLoadingIndicator').hide();
 				}, 2500);
 			} else {
@@ -174,7 +182,7 @@ function PasswordResetMailForm() {
 
 	$.ajax({
 		type: 'post',
-		url: '/forgot-password',
+		url: magicaiAuthUrl('/forgot-password'),
 		data: formData,
 		contentType: false,
 		processData: false,
@@ -183,7 +191,7 @@ function PasswordResetMailForm() {
 			Alpine.store('appLoadingIndicator').hide();
 		},
 		error: function (data) {
-			var err = data.responseJSON.errors;
+			var err = magicaiAuthErrors(data);
 			$.each(err, function (index, value) {
 				toastr.error(value);
 			});
@@ -209,19 +217,19 @@ function PasswordReset(password_reset_code) {
 
 	$.ajax({
 		type: 'post',
-		url: '/forgot-password/save',
+		url: magicaiAuthUrl('/forgot-password/save'),
 		data: formData,
 		contentType: false,
 		processData: false,
 		success: function (data) {
 			toastr.success(magicai_localize.password_reset_done);
 			setTimeout(function () {
-				location.href = '/dashboard';
+				location.href = magicaiAuthUrl('/dashboard');
 				Alpine.store('appLoadingIndicator').hide();
 			}, 1250);
 		},
 		error: function (data) {
-			var err = data.responseJSON.errors;
+			var err = magicaiAuthErrors(data);
 			$.each(err, function (index, value) {
 				toastr.error(value);
 			});

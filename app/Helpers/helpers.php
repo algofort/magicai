@@ -246,13 +246,19 @@ if (! function_exists('custom_theme_url')) {
     function custom_theme_url($url, $slash = false)
     {
         if (strpos($url, 'assets') !== false) {
-            return theme_url($url);
-        }
-        if ($slash) {
-            return '/' . $url;
+            $url = theme_url($url);
+        } elseif (! $slash && ! str_starts_with((string) $url, '/')) {
+            // Some callers also pass plain display text to this legacy helper.
+            return $url;
         }
 
-        return $url;
+        // Theme URLs and stored upload paths can be rooted at / even when the
+        // application is hosted below /magicai. Resolve them through its base.
+        return \App\Support\SubdirectoryUrl::asset(
+            (string) $url,
+            (string) config('app.url'),
+            config('app.asset_url')
+        );
     }
 }
 
