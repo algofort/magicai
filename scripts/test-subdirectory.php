@@ -42,3 +42,19 @@ same($base . '/upload/logo.png', custom_theme_url('upload/logo.png', true));
 same('MagicAI', custom_theme_url('MagicAI'));
 same('https://cdn.example.com/logo.png', custom_theme_url('https://cdn.example.com/logo.png', true));
 echo "Asset URL and shared helper checks passed.\n";
+
+// Check the generated PHP too: complex expressions inside @json can compile
+// incorrectly even when the original Blade file looks syntactically valid.
+$blade = new \Illuminate\View\Compilers\BladeCompiler(new \Illuminate\Filesystem\Filesystem, sys_get_temp_dir());
+$template = file_get_contents(dirname(__DIR__) . '/resources/views/default/panel/layout/scripts.blade.php');
+$compiled = tempnam(sys_get_temp_dir(), 'magicai-blade-');
+try {
+    file_put_contents($compiled, $blade->compileString($template));
+    exec(escapeshellarg(PHP_BINARY) . ' -l ' . escapeshellarg($compiled), $output, $status);
+    if ($status !== 0) {
+        throw new RuntimeException('Compiled auth Blade PHP failed syntax check.');
+    }
+} finally {
+    unlink($compiled);
+}
+echo "Compiled authentication Blade syntax check passed.\n";

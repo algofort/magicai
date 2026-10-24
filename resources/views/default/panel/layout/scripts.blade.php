@@ -111,8 +111,11 @@
 
 <!-- PAGES JS-->
 @guest()
+	@php
+		$magicaiBasePath = rtrim((string) parse_url(config('app.url'), PHP_URL_PATH), '/');
+	@endphp
 	<script>
-		window.magicaiBasePath = @json(rtrim((string) parse_url(config('app.url'), PHP_URL_PATH), '/'));
+		window.magicaiBasePath = @json($magicaiBasePath);
 	</script>
 	<script src="{{ custom_theme_url('/assets/js/panel/login_register.js') }}?v={{ filemtime(public_path('themes/default/assets/js/panel/login_register.js')) }}"></script>
 @endguest
